@@ -1,0 +1,11 @@
+trl
+torch
+transformers
+datasets
+peft
+accelerate
+bitsandbytes
+scipy
+tqdm
+requests
+together
