@@ -2,6 +2,7 @@
 import argparse
 import torch
 from datasets import load_dataset, Dataset
+from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainingArguments
 from trl import DPOTrainer
 from peft import LoraConfig
@@ -10,10 +11,36 @@ import re
 def extract_final_answer(response):
     match = re.search(r"####\s*(\d+)", response)
     if match:
-        return int(match.match(1))
+        return int(match.group(1))
     return None
 
+def evaluate(model, tokenizer, dataset_path="gsm8k_test.jsonl"):
+    print(f"\nEvaluating on {dataset_path}...")
+    dataset = load_dataset("json", data_files=dataset_path, split="train")
+    correct = 0
+    total = 0
+    for item in tqdm(dataset, desc="Evaluating"):
+        query = item["question"]
+        query_tensor = tokenizer.encode(query, return_tensors="pt").to(model.device)
+        
+        # Generate response
+        response_tensor = model.generate(query_tensor, max_length=1024, pad_token_id=tokenizer.eos_token_id)
+        response_text = tokenizer.decode(response_tensor[0], skip_special_tokens=True)
+        
+        # Extract answers
+        predicted_answer = extract_final_answer(response_text)
+        correct_answer = extract_final_answer(item["answer"])
+        
+        if predicted_answer is not None and predicted_answer == correct_answer:
+            correct += 1
+        total += 1
+        
+    accuracy = correct / total if total > 0 else 0
+    print(f"Accuracy: {accuracy:.4f} ({correct}/{total})")
+    return accuracy
+
 def create_preference_dataset(dataset):
+
     """
     This function creates a preference dataset from the original GSM8K dataset.
     For DPO, we need pairs of (chosen, rejected) responses.
@@ -85,10 +112,18 @@ def main(args):
         peft_config=peft_config,
     )
 
+    print("\nEvaluating before training...")
+    evaluate(dpo_trainer.model, tokenizer)
+
     # Train the model
+    print("\nTraining...")
     dpo_trainer.train()
 
+    print("\nEvaluating after training...")
+    evaluate(dpo_trainer.model, tokenizer)
+
     # Save the model
+    print("\nSaving model...")
     dpo_trainer.save_model(args.output_dir)
 
 if __name__ == "__main__":

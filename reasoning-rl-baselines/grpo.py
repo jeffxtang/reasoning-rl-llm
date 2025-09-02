@@ -57,6 +57,54 @@ def get_reasoning_coherence_score(reasoning: str) -> torch.Tensor:
         print(f"Error calling Together.ai API: {e}")
         return torch.tensor(0.5)  # Return neutral score on API error
 
+def evaluate(model, tokenizer, dataset_path="gsm8k_test.jsonl"):
+    print(f"\nEvaluating on {dataset_path}...")
+    dataset = load_dataset("json", data_files=dataset_path, split="train")
+    correct = 0
+    total = 0
+    for item in tqdm(dataset, desc="Evaluating"):
+        query = item["question"]
+        query_tensor = tokenizer.encode(query, return_tensors="pt").to(model.device)
+        
+        # Generate response
+        response_tensor = model.generate(query_tensor, max_length=1024, pad_token_id=tokenizer.eos_token_id)
+        response_text = tokenizer.decode(response_tensor[0], skip_special_tokens=True)
+        
+        # Extract answers
+        predicted_answer = extract_final_answer(response_text)
+        correct_answer = extract_final_answer(item["answer"])
+        
+        if predicted_answer is not None and predicted_answer == correct_answer:
+            correct += 1
+        total += 1
+        
+    accuracy = correct / total if total > 0 else 0
+    print(f"Accuracy: {accuracy:.4f} ({correct}/{total})")
+    return accuracy
+
+def reward_function(completions, **kwargs):
+
+    answer = kwargs.get("answer")
+    args = kwargs.get("args")
+    rewards = []
+    for i in range(len(completions)):
+        final_answer = extract_final_answer(completions[i])
+        correct_answer = extract_final_answer(answer[i])
+        
+        correctness = 1.0 if final_answer == correct_answer else 0.0
+        
+        if args.reward_type == 'correctness_only':
+            reward = torch.tensor(correctness)
+        elif args.reward_type == 'reasoning_aware':
+            reasoning_score = get_reasoning_coherence_score(completions[i])
+            reward = args.alpha * correctness + args.beta * reasoning_score
+        else:
+            raise ValueError("Invalid reward type specified")
+        
+        rewards.append(reward)
+    return rewards
+
+
 def main(args):
     # GRPO Configuration
     grpo_config = GRPOConfig(
@@ -105,38 +153,18 @@ def main(args):
         dataset=dataset,
         data_collator=lambda data: dict((key, [d[key] for d in data]) for key in data[0]),
         peft_config=lora_config,
+        reward_function=reward_function,
     )
 
-    # Training Loop
-    for epoch in tqdm(range(args.epochs), "epoch"):
-        for batch in tqdm(grpo_trainer.dataloader):
-            query_tensors = [tokenizer.encode(q, return_tensors="pt").to(model.device) for q in batch["query"]]
-            
-            # Get response from the model
-            response_tensors = grpo_trainer.generate(query_tensors, return_prompt=False)
-            batch['response'] = [tokenizer.decode(r.squeeze()) for r in response_tensors]
+    print("\nEvaluating before training...")
+    evaluate(grpo_trainer.model, tokenizer)
 
-            # Calculate reward
-            rewards = []
-            for i in range(len(batch['response'])):
-                final_answer = extract_final_answer(batch['response'][i])
-                correct_answer = extract_final_answer(batch['answer'][i])
-                
-                correctness = 1.0 if final_answer == correct_answer else 0.0
-                
-                if args.reward_type == 'correctness_only':
-                    reward = torch.tensor(correctness)
-                elif args.reward_type == 'reasoning_aware':
-                    reasoning_score = get_reasoning_coherence_score(batch['response'][i])
-                    reward = args.alpha * correctness + args.beta * reasoning_score
-                else:
-                    raise ValueError("Invalid reward type specified")
-                
-                rewards.append(reward)
+    # Training
+    print("\nTraining...")
+    grpo_trainer.train(reward_kwargs={"args": args})
 
-            # Run GRPO step
-            stats = grpo_trainer.step(query_tensors, response_tensors, rewards)
-            grpo_trainer.log_stats(stats, batch, rewards)
+    print("\nEvaluating after training...")
+    evaluate(grpo_trainer.model, tokenizer)
 
     # Save the model
     grpo_trainer.save_pretrained(args.output_dir)

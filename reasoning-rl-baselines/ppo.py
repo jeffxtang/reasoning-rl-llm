@@ -57,6 +57,51 @@ def get_reasoning_coherence_score(reasoning: str) -> torch.Tensor:
         print(f"Error calling Together.ai API: {e}")
         return torch.tensor(0.5)  # Return neutral score on API error
 
+def evaluate(model, tokenizer, dataset_path="gsm8k_test.jsonl"):
+    print(f"\nEvaluating on {dataset_path}...")
+    dataset = load_dataset("json", data_files=dataset_path, split="train")
+    correct = 0
+    total = 0
+    for item in tqdm(dataset, desc="Evaluating"):
+        query = item["question"]
+        query_tensor = tokenizer.encode(query, return_tensors="pt").to(model.device)
+        
+        # Generate response
+        response_tensor = model.generate(query_tensor, max_length=1024, pad_token_id=tokenizer.eos_token_id)
+        response_text = tokenizer.decode(response_tensor[0], skip_special_tokens=True)
+        
+        # Extract answers
+        predicted_answer = extract_final_answer(response_text)
+        correct_answer = extract_final_answer(item["answer"])
+        
+        if predicted_answer is not None and predicted_answer == correct_answer:
+            correct += 1
+        total += 1
+        
+    accuracy = correct / total if total > 0 else 0
+    print(f"Accuracy: {accuracy:.4f} ({correct}/{total})")
+    return accuracy
+
+def calculate_rewards(responses, answers, args):
+
+    rewards = []
+    for i in range(len(responses)):
+        final_answer = extract_final_answer(responses[i])
+        correct_answer = extract_final_answer(answers[i])
+        
+        correctness = 1.0 if final_answer == correct_answer else 0.0
+        
+        if args.reward_type == 'correctness_only':
+            reward = torch.tensor(correctness)
+        elif args.reward_type == 'reasoning_aware':
+            reasoning_score = get_reasoning_coherence_score(responses[i])
+            reward = args.alpha * correctness + args.beta * reasoning_score
+        else:
+            raise ValueError("Invalid reward type specified")
+        
+        rewards.append(reward)
+    return rewards
+
 def main(args):
     # PPO Configuration
     ppo_config = PPOConfig(
@@ -106,7 +151,11 @@ def main(args):
         peft_config=lora_config,
     )
 
+    print("\nEvaluating before training...")
+    evaluate(ppo_trainer.model, tokenizer)
+
     # Training Loop
+    print("\nTraining...")
     for epoch in tqdm(range(args.epochs), "epoch"):
         for batch in tqdm(ppo_trainer.dataloader):
             query_tensors = [tokenizer.encode(q, return_tensors="pt").to(model.device) for q in batch["query"]]
@@ -116,26 +165,14 @@ def main(args):
             batch['response'] = [tokenizer.decode(r.squeeze()) for r in response_tensors]
 
             # Calculate reward
-            rewards = []
-            for i in range(len(batch['response'])):
-                final_answer = extract_final_answer(batch['response'][i])
-                correct_answer = extract_final_answer(batch['answer'][i])
-                
-                correctness = 1.0 if final_answer == correct_answer else 0.0
-                
-                if args.reward_type == 'correctness_only':
-                    reward = torch.tensor(correctness)
-                elif args.reward_type == 'reasoning_aware':
-                    reasoning_score = get_reasoning_coherence_score(batch['response'][i])
-                    reward = args.alpha * correctness + args.beta * reasoning_score
-                else:
-                    raise ValueError("Invalid reward type specified")
-                
-                rewards.append(reward)
+            rewards = calculate_rewards(batch['response'], batch['answer'], args)
 
             # Run PPO step
             stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
             ppo_trainer.log_stats(stats, batch, rewards)
+
+    print("\nEvaluating after training...")
+    evaluate(ppo_trainer.model, tokenizer)
 
     # Save the model
     ppo_trainer.save_pretrained(args.output_dir)
